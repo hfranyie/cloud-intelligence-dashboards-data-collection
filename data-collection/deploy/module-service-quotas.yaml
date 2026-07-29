@@ -74,6 +74,7 @@ Resources:
         Parameters:
           "use.null.for.invalid.data": "true"
           "classification": "json"
+          "UPDATED_BY_CRAWLER": !Sub "${ResourcePrefix}${CFDataName}-Crawler"
         StorageDescriptor:
           Columns:
             - Name: servicecode
@@ -136,6 +137,7 @@ Resources:
         Parameters:
           "use.null.for.invalid.data": "true"
           "classification": "json"
+          "UPDATED_BY_CRAWLER": !Sub "${ResourcePrefix}${CFDataName}-Crawler"
         StorageDescriptor:
           Columns:
             - Name: id
@@ -401,10 +403,9 @@ Resources:
               return quotas
 
           def process_service_worker(args):
-              service, i, total_services, session, region = args
+              service, i, total_services, sq_client = args
               service_code = service['ServiceCode']
               service_name = service['ServiceName']
-              sq_client = session.client('service-quotas', region_name=region, config=config)
               try:
                   quotas = get_service_quotas(sq_client, service_code)
                   for q in quotas:
@@ -476,7 +477,7 @@ Resources:
                   if services_filter:
                       services = [s for s in services if s['ServiceCode'] in services_filter]
                       logger.info(f"Service filter applied: collecting {len(services)} services ({services_filter})")
-                  service_args = [(s, i, len(services), session, region) for i, s in enumerate(services, 1)]
+                  service_args = [(s, i, len(services), sq_client) for i, s in enumerate(services, 1)]
                   all_quotas = []
                   with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
                       for result in executor.map(process_service_worker, service_args):
