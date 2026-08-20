@@ -70,7 +70,7 @@ Resources:
       CatalogId: !Ref AWS::AccountId
       DatabaseName: !Ref DatabaseName
       TableInput:
-        Name: !Sub "${CFDataName}_data"
+        Name: service_quotas_data
         Parameters:
           "use.null.for.invalid.data": "true"
           "classification": "json"
