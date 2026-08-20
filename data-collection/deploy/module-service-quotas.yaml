@@ -133,7 +133,7 @@ Resources:
       CatalogId: !Ref AWS::AccountId
       DatabaseName: !Ref DatabaseName
       TableInput:
-        Name: !Sub "${CFDataName}_history"
+        Name: service_quotas_history
         Parameters:
           "use.null.for.invalid.data": "true"
           "classification": "json"
