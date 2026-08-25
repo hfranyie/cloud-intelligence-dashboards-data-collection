@@ -117,6 +117,61 @@ grant account-wide or service-wide wildcards on data actions.
   unavoidable, and the `reason` must state why scoping is not possible.
 - Grant only the specific actions required (e.g. `s3:GetObject`,
   `s3:ListBucket`) — do not use `s3:*` or `s3:Get*`.
+- **Service-read permissions belong on the multi-account role, not the module's
+  Lambda execution role.** For LINKED modules the collector Lambda runs in the
+  data-collection account and *assumes* the multi-account role
+  (`${MultiAccountRoleName}`) in each target account; the `describe_*` / `list_*`
+  calls execute with the **assumed** role's credentials. Therefore:
+  - The module template's `LambdaRole` (in `module-<svc>.yaml`) carries **only**
+    plumbing: `sts:AssumeRole` on
+    `arn:${AWS::Partition}:iam::*:role/${MultiAccountRoleName}`, `s3:PutObject` on
+    `${DestinationBucketARN}/*`, and — when the bucket may be encrypted —
+    `kms:GenerateDataKey`. It must **not** grant the service `describe_*` /
+    `list_*` actions; those never run under this role, so granting them is dead
+    (and often triggers an avoidable `W11` suppression).
+  - The service-read actions (e.g. `rds:DescribePendingMaintenanceActions`) go in
+    a least-privilege `AWS::IAM::Policy` on the multi-account role in
+    `deploy-in-linked-account.yaml`, gated by the module's
+    `Include<Name>ModulePolicy` condition.
+
+  This is the established pattern — the execution role is plumbing-only
+  (AssumeRole + S3 + KMS) across `module-inventory.yaml`, `module-rds-usage.yaml`,
+  `module-budgets.yaml`, `module-transit-gateway.yaml`,
+  `module-ecs-chargeback.yaml`, `module-support-cases.yaml`, and others; the
+  service-read actions live in `deploy-in-linked-account.yaml`.
+
+### 1.8 Glue Crawlers and Table Schemas
+
+Data is written as JSONL and read by a Glue crawler into an Athena table.
+Crawler type inference is **presence-dependent**: a field that is empty in one
+partition and populated in another is inferred as different types, and those
+partitions then fail to load together in the same Athena view (this has bitten
+us before — e.g. `event_metadata` in the Health module). Rules:
+
+- **Pre-create typed tables; don't let the crawler own the schema.** Declare the
+  `AWS::Glue::Table` (or the inventory `AwsObjects` table mapping) with explicit
+  columns and point the crawler at the same location so it only updates
+  partitions.
+- **Use the standard schema-safe crawler config on every crawler** so the crawler
+  adds columns but never rewrites or drops existing ones:
+  ```yaml
+  Configuration: '{"Version":1.0,"Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas"},"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"},"Tables":{"TableThreshold":<n>,"AddOrUpdateBehavior":"MergeNewColumns"}}}'
+  SchemaChangePolicy:
+    UpdateBehavior: UPDATE_IN_DATABASE
+    DeleteBehavior: LOG
+  ```
+  `TableThreshold` = the number of distinct S3 target paths that combine into one
+  table (usually `1`). This config is standard across the modules — e.g.
+  `module-trusted-advisor.yaml`, `module-inventory.yaml`, `module-health-events.yaml`,
+  `module-identity-center.yaml`, `module-pricing.yaml`, and `module-resilience-hub.yaml`.
+- **Prefer `string` (raw JSON) over `array<struct<…>>` or `map<…>` for variable
+  or optional nested fields.** A `string` column never drifts and survives AWS
+  API schema changes; parse it in a **derived Athena view** with `json_parse` /
+  `json_extract` / `UNNEST` rather than baking a rigid shape into the table.
+  Reserve `array<struct<…>>` / `map<string,string>` for stable shapes on a
+  pre-created table with the crawler config above. Note `map<string,string>`
+  requires flat string→string data *and* a pre-created table — crawlers infer a
+  JSON object as `struct`, so they will overwrite a `map` column otherwise.
 
 ---
 
@@ -206,6 +261,10 @@ The custom pylint runner (`utils/pylint.py`) disables these checks for inline La
 - Use lazy `%s` formatting in logging calls for standalone scripts
 - Prefer `boto3.client()` over `boto3.resource()`
 - Use `boto3.session.Session().get_partition_for_region()` for partition-aware ARN construction
+- **Paginate every AWS `list_*` / `describe_*` call** with
+  `client.get_paginator(...)` (or an explicit token loop). Never read a single
+  response page: APIs such as `describe_pending_maintenance_actions` cap results
+  per page and silently truncate collection for large accounts.
 - Temp files go in `/tmp/` (Lambda constraint)
 - JSONL format for data files (one JSON object per line, newline-delimited)
 - Add docstrings to all functions and methods in standalone scripts
@@ -275,3 +334,36 @@ KIRO_SOURCE_BUCKETS = os.environ.get('KIRO_SOURCE_BUCKETS', f'cid-dc-kiro-activi
 ```
 
 Document any such environment variable in `data-collection/CONTRIBUTING.md`.
+
+---
+
+## 7. Review Checklist for Module Changes
+
+Fast checks when authoring or reviewing a data-collection module (each links to
+the section with detail):
+
+- [ ] **Permission placement** — execution-role holds only `AssumeRole` +
+      `s3:PutObject` + KMS; service `describe_*` / `list_*` permissions live on
+      the multi-account role in `deploy-in-linked-account.yaml`, gated by
+      `Include<Name>ModulePolicy` (§1.7).
+- [ ] **Pagination** — every `list_*` / `describe_*` call is paginated (§4).
+- [ ] **Crawlers & schemas** — every crawler uses the standard schema-safe config
+      (`InheritFromTable` / `MergeNewColumns` + `SchemaChangePolicy`) and points at
+      a pre-created table; variable nested fields are `string` + Athena view, not
+      `array<struct<…>>` / `map` (§1.8).
+- [ ] **Analytics** — `AnalyticsExecutor` (`Custom::LambdaAnalyticsExecutor`)
+      resource is present and wired to `LambdaAnalyticsARN`.
+- [ ] **KMS** — a `kms:GenerateDataKey` policy exists whenever the module accepts
+      `DataBucketsKmsKeysArns`.
+- [ ] **Naming** — the same token appears in the file name, `Include…Module`
+      parameter, `Deploy…` condition, and nested-stack logical id
+      (`data-collection/MODULE_GUIDELINES.md` §3).
+- [ ] **Topology** — LINKED-only modules do **not** modify
+      `deploy-in-management-account.yaml`; payer-account coverage comes from
+      deploying `deploy-in-linked-account.yaml` into the management account
+      (MODULE_GUIDELINES §5).
+- [ ] **Wiring completeness** — the `Include…Module` parameter is threaded
+      through every consumer in `deploy-data-read-permissions.yaml` (org StackSet
+      **and** the management-account nested stack).
+- [ ] **Tests** — the module is enabled in the from-scratch suite with a table
+      assertion (§6).
